@@ -46,6 +46,7 @@ class Mamba(nn.Module):
         dt_init_floor=1e-4,
         conv_bias=True,
         bias=False,
+        bidirectional=False,
         use_fast_path=True,  # Fused kernel options
         layer_idx=None,
         device=None,
@@ -59,20 +60,41 @@ class Mamba(nn.Module):
         self.expand = expand
         self.d_inner = int(self.expand * self.d_model)
         self.dt_rank = math.ceil(self.d_model / self.d_state) if dt_rank == "auto" else dt_rank
+        self.bidirectional = bidirectional
         self.use_fast_path = use_fast_path
         self.layer_idx = layer_idx
 
         self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=bias, **factory_kwargs)
-
-        self.conv1d = nn.Conv1d(
-            in_channels=self.d_inner,
-            out_channels=self.d_inner,
-            bias=conv_bias,
-            kernel_size=d_conv,
-            groups=self.d_inner,
-            padding=d_conv - 1,
-            **factory_kwargs,
-        )
+        if bidirectional:
+            assert self.d_inner % 2 == 0
+            self.conv1d_fwd = nn.Conv1d(
+                in_channels=self.d_inner,
+                out_channels=self.d_inner//2,
+                bias=conv_bias,
+                kernel_size=d_conv,
+                groups=self.d_inner,
+                padding=d_conv - 1,
+                **factory_kwargs,
+            )
+            self.conv1d_bwd = nn.Conv1d(
+                in_channels=self.d_inner,
+                out_channels=self.d_inner//2,
+                bias=conv_bias,
+                kernel_size=d_conv,
+                groups=self.d_inner,
+                padding=d_conv - 1,
+                **factory_kwargs,
+            )
+        else:
+            self.conv1d = nn.Conv1d(
+                in_channels=self.d_inner,
+                out_channels=self.d_inner,
+                bias=conv_bias,
+                kernel_size=d_conv,
+                groups=self.d_inner,
+                padding=d_conv - 1,
+                **factory_kwargs,
+            )
 
         self.activation = "silu"
         self.act = nn.SiLU()
@@ -146,36 +168,50 @@ class Mamba(nn.Module):
         A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
         # In the backward pass we write dx and dz next to each other to avoid torch.cat
         if self.use_fast_path and inference_params is None:  # Doesn't support outputting the states
-            out = mamba_inner_fn(
-                xz,
-                self.conv1d.weight,
-                self.conv1d.bias,
-                self.x_proj.weight,
-                self.dt_proj.weight,
-                self.out_proj.weight,
-                self.out_proj.bias,
-                A,
-                None,  # input-dependent B
-                None,  # input-dependent C
-                self.D.float(),
-                delta_bias=self.dt_proj.bias.float(),
-                delta_softplus=True,
-            )
+            if self.bidirectional:
+                pass
+            else:
+                out = mamba_inner_fn(
+                    xz,
+                    self.conv1d.weight,
+                    self.conv1d.bias,
+                    self.x_proj.weight,
+                    self.dt_proj.weight,
+                    self.out_proj.weight,
+                    self.out_proj.bias,
+                    A,
+                    None,  # input-dependent B
+                    None,  # input-dependent C
+                    self.D.float(),
+                    delta_bias=self.dt_proj.bias.float(),
+                    delta_softplus=True,
+                )
         else:
             x, z = xz.chunk(2, dim=1)
             # Compute short convolution
             if conv_state is not None:
                 conv_state.copy_(x[:, :, -self.d_conv :])  # Update state (B D W)
             if causal_conv1d_fn is None:
-                x = self.act(self.conv1d(x)[..., :seqlen])
+                if self.bidirectional:
+                    x = self.act(self.conv1d(x)[..., :seqlen])
+                else:
+                    x = self.act(self.conv1d(x)[..., :seqlen])
             else:
                 assert self.activation in ["silu", "swish"]
-                x = causal_conv1d_fn(
-                    x,
-                    rearrange(self.conv1d.weight, "d 1 w -> d w"),
-                    self.conv1d.bias,
-                    self.activation,
-                )
+                if self.bidirectional:
+                    x = causal_conv1d_fn(
+                        x,
+                        rearrange(self.conv1d.weight, "d 1 w -> d w"),
+                        self.conv1d.bias,
+                        self.activation,
+                    )
+                else:
+                    x = causal_conv1d_fn(
+                        x,
+                        rearrange(self.conv1d.weight, "d 1 w -> d w"),
+                        self.conv1d.bias,
+                        self.activation,
+                    )
 
             # We're careful here about the layout, to avoid extra transposes.
             # We want dt to have d as the slowest moving dimension
