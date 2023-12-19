@@ -10,26 +10,13 @@ from torch import Tensor
 
 from einops import rearrange, repeat
 
-try:
-    from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
-except ImportError:
-    causal_conv1d_fn, causal_conv1d_update = None
+causal_conv1d_fn, causal_conv1d_update = None
 
-try:
-    from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, mamba_inner_fn
-except ImportError:
-    selective_scan_fn, mamba_inner_fn = None, None, None
+from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, mamba_inner_fn
 
-try:
-    from mamba_ssm.ops.triton.selective_state_update import selective_state_update
-except ImportError:
-    selective_state_update = None
+selective_state_update = None
 
-try:
-    from mamba_ssm.ops.triton.layernorm import RMSNorm, layer_norm_fn, rms_norm_fn
-except ImportError:
-    RMSNorm, layer_norm_fn, rms_norm_fn = None, None, None
-
+from mamba_ssm.ops.triton.layernorm import RMSNorm, layer_norm_fn, rms_norm_fn
 
 class Mamba(nn.Module):
     def __init__(
@@ -166,16 +153,7 @@ class Mamba(nn.Module):
             # Compute short convolution
             if conv_state is not None:
                 conv_state.copy_(x[:, :, -self.d_conv :])  # Update state (B D W)
-            if causal_conv1d_fn is None:
-                x = self.act(self.conv1d(x)[..., :seqlen])
-            else:
-                assert self.activation in ["silu", "swish"]
-                x = causal_conv1d_fn(
-                    x,
-                    rearrange(self.conv1d.weight, "d 1 w -> d w"),
-                    self.conv1d.bias,
-                    self.activation,
-                )
+            x = self.act(self.conv1d(x)[..., :seqlen])
 
             # We're careful here about the layout, to avoid extra transposes.
             # We want dt to have d as the slowest moving dimension
@@ -213,21 +191,12 @@ class Mamba(nn.Module):
         x, z = xz.chunk(2, dim=-1)  # (B D)
 
         # Conv step
-        if causal_conv1d_update is None:
-            conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))  # Update state (B D W)
-            conv_state[:, :, -1] = x
-            x = torch.sum(conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1)  # (B D)
-            if self.conv1d.bias is not None:
-                x = x + self.conv1d.bias
+        conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))  # Update state (B D W)
+        conv_state[:, :, -1] = x
+        x = torch.sum(conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1)  # (B D)
+        if self.conv1d.bias is not None:
+            x = x + self.conv1d.bias
             x = self.act(x).to(dtype=dtype)
-        else:
-            x = causal_conv1d_update(
-                x,
-                conv_state,
-                rearrange(self.conv1d.weight, "d 1 w -> d w"),
-                self.conv1d.bias,
-                self.activation,
-            )
 
         x_db = self.x_proj(x)  # (B dt_rank+2*d_state)
         dt, B, C = torch.split(x_db, [self.dt_rank, self.d_state, self.d_state], dim=-1)
@@ -236,19 +205,14 @@ class Mamba(nn.Module):
         A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
 
         # SSM step
-        if selective_state_update is None:
-            # Discretize A and B
-            dt = F.softplus(dt + self.dt_proj.bias.to(dtype=dt.dtype))
-            dA = torch.exp(torch.einsum("bd,dn->bdn", dt, A))
-            dB = torch.einsum("bd,bn->bdn", dt, B)
-            ssm_state.copy_(ssm_state * dA + rearrange(x, "b d -> b d 1") * dB)
-            y = torch.einsum("bdn,bn->bd", ssm_state.to(dtype), C)
-            y = y + self.D.to(dtype) * x
-            y = y * self.act(z)  # (B D)
-        else:
-            y = selective_state_update(
-                ssm_state, x, dt, A, B, C, self.D, z=z, dt_bias=self.dt_proj.bias, dt_softplus=True
-            )
+        # Discretize A and B
+        dt = F.softplus(dt + self.dt_proj.bias.to(dtype=dt.dtype))
+        dA = torch.exp(torch.einsum("bd,dn->bdn", dt, A))
+        dB = torch.einsum("bd,bn->bdn", dt, B)
+        ssm_state.copy_(ssm_state * dA + rearrange(x, "b d -> b d 1") * dB)
+        y = torch.einsum("bdn,bn->bd", ssm_state.to(dtype), C)
+        y = y + self.D.to(dtype) * x
+        y = y * self.act(z)  # (B D)
 
         out = self.out_proj(y)
         return out.unsqueeze(1), conv_state, ssm_state
