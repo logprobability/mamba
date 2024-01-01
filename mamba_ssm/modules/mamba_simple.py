@@ -45,7 +45,7 @@ class Mamba(nn.Module):
         self.d_conv = d_conv
         self.expand = expand
         self.d_inner = int(self.expand * self.d_model)
-        self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else dt_rank
+        self.dt_rank = math.ceil(self.d_model / self.d_state) if dt_rank == "auto" else dt_rank
         self.use_fast_path = use_fast_path
         self.layer_idx = layer_idx
 
